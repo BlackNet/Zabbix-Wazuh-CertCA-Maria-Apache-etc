@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Stage 2: Zabbix 7.4 server + frontend (Apache) + agent2 + landing page
+# Stage 2: Zabbix server + frontend (Apache) + agent2 + landing page
 # Debian 13 (Trixie).  Requires stage 1.  Run as root.  Idempotent.
 #
 set -euo pipefail
@@ -10,7 +10,18 @@ set -euo pipefail
 # ###########################################################################
 TS_HOSTNAME="ssgc.taile9333.ts.net"     # this node's MagicDNS FQDN
 ZABBIX_TIMEZONE="America/New_York"       # PHP/Zabbix timezone (Eastern here)
+ZABBIX_MAJOR="8.0"                       # 8.0 LTS track (GA planned Q3 2026)
 # ###########################################################################
+#
+# NOTE ON 8.0 AND CHANNELS
+# The zabbix-release deb enables both 8.0/release (the GA shelf, currently
+# arch-independent only) and 8.0/unstable (serving 8.0.0~beta2 today).  The
+# APT pin below covers repo.zabbix.com broadly, so apt simply picks the
+# highest version across both channels.  When 8.0.0 GA publishes to the
+# release channel, a plain 'apt update && apt upgrade' moves you to it - the
+# tilde in '8.0.0~beta2' sorts BELOW '8.0.0', so GA wins automatically.
+# No repo edits, no un-pinning, no hoops.
+#
 
 # --- Derived / usually leave alone ---------------------------------------
 SITE="$(echo "$TS_HOSTNAME" | cut -d. -f1)"
@@ -18,7 +29,6 @@ SITE_UP="$(echo "$SITE" | tr '[:lower:]' '[:upper:]')"   # visible Zabbix name
 CRED_FILE="/root/.${SITE}-credentials"
 CERT_DIR="/etc/ssl/tailscale"
 
-ZABBIX_MAJOR="7.4"
 DEB_VER="debian13"
 ZABBIX_RELEASE_DEB="zabbix-release_latest_${ZABBIX_MAJOR}+${DEB_VER}_all.deb"
 ZABBIX_RELEASE_URL="https://repo.zabbix.com/zabbix/${ZABBIX_MAJOR}/release/debian/pool/main/z/zabbix-release/${ZABBIX_RELEASE_DEB}"
@@ -58,7 +68,19 @@ if ! dpkg-deb --info "$TMPDEB" >/dev/null 2>&1; then
 fi
 dpkg -i "$TMPDEB"
 
-# --- APT pin: force zabbix* from upstream, ends the 7.0-vs-7.4 fight -----
+# The 8.0 release deb manages zabbix-release/-tools/-unstable .sources, but a
+# prior 7.x install leaves an orphaned zabbix.sources behind that it does not
+# own.  Remove it so only the current deb's sources are active.
+if [ -f /etc/apt/sources.list.d/zabbix.sources ]; then
+    echo "==> Removing orphaned zabbix.sources from a prior release"
+    rm -f /etc/apt/sources.list.d/zabbix.sources
+fi
+
+# --- APT pin -------------------------------------------------------------
+# Purpose: keep Debian's bundled zabbix (7.0, priority 500) from ever winning.
+# It deliberately does NOT lock a channel or version - every repo.zabbix.com
+# source gets 1001, so apt freely picks the highest version available.  That
+# means 'apt update && apt upgrade' carries beta -> GA with no intervention.
 echo "==> Pinning zabbix* packages to repo.zabbix.com"
 cat > /etc/apt/preferences.d/99-zabbix-upstream <<'PINEOF'
 Package: zabbix*
@@ -69,9 +91,15 @@ PINEOF
 apt-get update
 
 echo "==> Verifying candidate resolves to upstream ${ZABBIX_MAJOR}"
-if apt-cache policy zabbix-server-mysql | awk '/Candidate:/{print $2}' | grep -q "${ZABBIX_MAJOR}\."; then
-    CANDVER="$(apt-cache policy zabbix-server-mysql | awk '/Candidate:/{print $2}')"
+CANDVER="$(apt-cache policy zabbix-server-mysql | awk '/Candidate:/{print $2}')"
+# Accepts 8.0.0~beta2 now and plain 8.0.x at GA - both match "8.0".
+if echo "$CANDVER" | grep -q "${ZABBIX_MAJOR}\."; then
     echo "    OK - candidate ${CANDVER}"
+    case "$CANDVER" in
+        *~alpha*|*~beta*|*~rc*)
+            echo "    NOTE: this is a pre-release build. GA will supersede it"
+            echo "          automatically on a later 'apt upgrade'." ;;
+    esac
 else
     echo "ERROR: candidate is not upstream ${ZABBIX_MAJOR}:" >&2
     apt-cache policy zabbix-server-mysql >&2; exit 1
@@ -213,6 +241,26 @@ a2ensite "${SITE}-ssl"
 a2dissite 000-default 2>/dev/null || true
 a2disconf zabbix 2>/dev/null || true
 apache2ctl configtest
+
+# --- Boot ordering: Apache binds the Tailscale IP, which does not exist
+# until tailscaled is up.  Without this, apache2 fails at boot.
+echo "==> Allowing bind to not-yet-present addresses (ip_nonlocal_bind)"
+cat > /etc/sysctl.d/99-nonlocal-bind.conf <<'SYSCTLEOF'
+# Let services bind an address before the interface is up (Tailscale IP at
+# boot).  Cockpit's socket uses FreeBind=yes for the same reason; Apache and
+# the Wazuh dashboard have no equivalent, so this is set kernel-wide.
+net.ipv4.ip_nonlocal_bind = 1
+SYSCTLEOF
+sysctl -q -p /etc/sysctl.d/99-nonlocal-bind.conf
+
+echo "==> Ordering apache2 after tailscaled"
+install -d -m 0755 /etc/systemd/system/apache2.service.d
+cat > /etc/systemd/system/apache2.service.d/tailscale.conf <<'APEOF'
+[Unit]
+After=tailscaled.service network-online.target
+Wants=tailscaled.service network-online.target
+APEOF
+systemctl daemon-reload
 
 # --- Agent2 --------------------------------------------------------------
 echo "==> Configuring zabbix-agent2"
