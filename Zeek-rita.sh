@@ -163,11 +163,17 @@ curl -fsSL -O "${DZ_URL}"
 CS_URL="$(gh_asset_url activecm/docker-zeek "${DZ_TAG}" 'checksums.txt')"
 if [[ -n "${CS_URL}" ]]; then
     curl -fsSL -O "${CS_URL}"
-    # sha256sum -c matches by filename, so keep the original asset name.
-    if sha256sum -c checksums.txt 2>/dev/null | grep -q "${DZ_ASSET}: OK"; then
+    # checksums.txt is multi-arch; verifying the whole file fails on the
+    # arch we didn't download (missing file). Extract only OUR line and
+    # verify just that, so the other-arch entry can't false-fail us.
+    if grep -F " ${DZ_ASSET}" checksums.txt > our-checksum.txt \
+       && [[ -s our-checksum.txt ]] \
+       && sha256sum -c our-checksum.txt >/dev/null 2>&1; then
         echo "   checksum OK for ${DZ_ASSET}"
     else
         echo "ERROR: checksum FAILED for ${DZ_ASSET}. Refusing to install." >&2
+        echo "   expected: $(grep -F " ${DZ_ASSET}" checksums.txt || echo '<line not found>')" >&2
+        echo "   actual  : $(sha256sum "${DZ_ASSET}" 2>/dev/null || echo '<hash failed>')" >&2
         popd >/dev/null; rm -rf "${DZ_TMP}"; exit 1
     fi
 else
