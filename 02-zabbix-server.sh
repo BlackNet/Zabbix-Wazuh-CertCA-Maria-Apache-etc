@@ -8,19 +8,35 @@ set -euo pipefail
 # ###########################################################################
 # ##  EDIT PER SITE  ########################################################
 # ###########################################################################
-TS_HOSTNAME="ssgc.taile9333.ts.net"     # this node's MagicDNS FQDN
-ZABBIX_TIMEZONE="America/New_York"       # PHP/Zabbix timezone (Eastern here)
-ZABBIX_MAJOR="8.0"                       # 8.0 LTS track (GA planned Q3 2026)
+TS_HOSTNAME="monitor.example.ts.net"    # this node's MagicDNS FQDN
+ZABBIX_TIMEZONE="America/New_York"       # PHP/Zabbix timezone
+ZABBIX_MAJOR="8.0"                       # 8.0 LTS track
+
+# Address Apache binds for the Zabbix UI / landing page.
+#   "tailscale"  - Tailscale IP only.  UI unreachable from the LAN; correct
+#                  for sites administered entirely over the tailnet.
+#   "all"        - 0.0.0.0.  Needed when on-site staff open the UI from the
+#                  plant/office LAN.  The TLS cert is a Tailscale cert, so
+#                  LAN users will see a name mismatch unless they reach the
+#                  box by its MagicDNS name.
+#   <literal IP> - bind one specific address.
+APACHE_BIND="tailscale"
 # ###########################################################################
 #
 # NOTE ON 8.0 AND CHANNELS
-# The zabbix-release deb enables both 8.0/release (the GA shelf, currently
-# arch-independent only) and 8.0/unstable (serving 8.0.0~beta2 today).  The
-# APT pin below covers repo.zabbix.com broadly, so apt simply picks the
-# highest version across both channels.  When 8.0.0 GA publishes to the
-# release channel, a plain 'apt update && apt upgrade' moves you to it - the
-# tilde in '8.0.0~beta2' sorts BELOW '8.0.0', so GA wins automatically.
-# No repo edits, no un-pinning, no hoops.
+# The zabbix-release deb enables both 8.0/release (the GA shelf) and
+# 8.0/unstable (serving pre-release builds).  The APT pin below covers
+# repo.zabbix.com broadly, so apt simply picks the highest version across
+# both channels.  When 8.0.0 GA publishes to the release channel, a plain
+# 'apt update && apt upgrade' moves you to it - the tilde in '8.0.0~beta2'
+# sorts BELOW '8.0.0', so GA wins automatically.  No repo edits, no
+# un-pinning, no hoops.
+#
+# As of this writing 8.0 has not reached GA and the candidate resolves to a
+# pre-release build.  The script prints the resolved version and warns; if
+# you need a stable release today, set ZABBIX_MAJOR="7.4".  Note that the
+# Zabbix schema upgrades one-way: a database created or upgraded by 8.0
+# cannot be served by a 7.x binary.
 #
 
 # --- Derived / usually leave alone ---------------------------------------
@@ -48,6 +64,14 @@ if [ ! -f "$CRED_FILE" ]; then echo "ERROR: $CRED_FILE not found - run 01 first"
 if [ ! -s "${CERT_DIR}/${TS_HOSTNAME}.crt" ]; then echo "ERROR: TLS cert missing" >&2; exit 1; fi
 TS_IP4="$(tailscale ip -4)"
 if [ -z "$TS_IP4" ]; then echo "ERROR: no Tailscale IPv4" >&2; exit 1; fi
+
+# Resolve APACHE_BIND to the address Listen/VirtualHost will use.
+case "$APACHE_BIND" in
+    tailscale) BIND_ADDR="$TS_IP4" ;;
+    all)       BIND_ADDR="0.0.0.0" ;;
+    *)         BIND_ADDR="$APACHE_BIND" ;;
+esac
+echo "==> Apache will bind ${BIND_ADDR} (APACHE_BIND=${APACHE_BIND})"
 
 # --- Apache + PHP (explicit) ---------------------------------------------
 echo "==> Installing Apache and PHP explicitly"
@@ -87,6 +111,7 @@ Package: zabbix*
 Pin: origin "repo.zabbix.com"
 Pin-Priority: 1001
 PINEOF
+chmod 0644 /etc/apt/preferences.d/99-zabbix-upstream
 
 apt-get update
 
@@ -97,8 +122,10 @@ if echo "$CANDVER" | grep -q "${ZABBIX_MAJOR}\."; then
     echo "    OK - candidate ${CANDVER}"
     case "$CANDVER" in
         *~alpha*|*~beta*|*~rc*)
-            echo "    NOTE: this is a pre-release build. GA will supersede it"
-            echo "          automatically on a later 'apt upgrade'." ;;
+            echo "    NOTE: this is a PRE-RELEASE build. GA will supersede it"
+            echo "          automatically on a later 'apt upgrade'."
+            echo "          The Zabbix schema upgrades one-way - take a dump"
+            echo "          before any major-version start." ;;
     esac
 else
     echo "ERROR: candidate is not upstream ${ZABBIX_MAJOR}:" >&2
@@ -116,6 +143,8 @@ TABLE_COUNT="$(mariadb --protocol=socket -uroot -N -B -e \
     "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${ZABBIX_DB_NAME}';")"
 if [ "$TABLE_COUNT" -eq 0 ]; then
     echo "==> Importing Zabbix schema"
+    echo "    (slow on spinning disks - watch the table count from another"
+    echo "     shell if you need reassurance it is progressing)"
     mariadb --protocol=socket -uroot -e "SET GLOBAL log_bin_trust_function_creators = 1;"
     if ! zcat /usr/share/zabbix/sql-scripts/mysql/server.sql.gz \
         | mariadb --default-character-set=utf8mb4 \
@@ -124,19 +153,45 @@ if [ "$TABLE_COUNT" -eq 0 ]; then
         echo "ERROR: schema import failed" >&2; exit 1
     fi
     mariadb --protocol=socket -uroot -e "SET GLOBAL log_bin_trust_function_creators = 0;"
+
+    # The stock schema names its self-monitoring host "Zabbix server", but
+    # the agent2 config below announces itself as ${SITE_UP}.  Without this
+    # rename the server logs 'host not found' for every heartbeat and active
+    # check request.  Guarded inside the fresh-import branch so a restored
+    # or migrated database is never touched.
+    echo "==> Renaming built-in host 'Zabbix server' -> ${SITE_UP}"
+    mariadb --protocol=socket -uroot "${ZABBIX_DB_NAME}" <<SQL
+UPDATE hosts SET host='${SITE_UP}', name='${SITE_UP}'
+ WHERE host='Zabbix server';
+SQL
 else
-    echo "==> Schema already present (${TABLE_COUNT} tables) - skipping"
+    echo "==> Schema already present (${TABLE_COUNT} tables) - skipping import"
+    echo "    NOTE: not renaming the self-monitoring host on an existing"
+    echo "          database.  If agent2 logs 'host [${SITE_UP}] not found',"
+    echo "          either rename the host in the UI or set Hostname= in"
+    echo "          /etc/zabbix/zabbix_agent2.conf to match it."
 fi
 
 # --- Zabbix server config ------------------------------------------------
+# set_conf <file> <key> <value> - handles set, commented-out, and absent.
+set_conf() {
+    local f="$1" k="$2" v="$3"
+    if grep -q "^${k}=" "$f"; then
+        sed -i "s|^${k}=.*|${k}=${v}|" "$f"
+    elif grep -q "^# *${k}=" "$f"; then
+        sed -i "s|^# *${k}=.*|${k}=${v}|" "$f"
+    else
+        echo "${k}=${v}" >> "$f"
+    fi
+}
+
 echo "==> Configuring zabbix_server.conf"
-if grep -q '^DBPassword=' /etc/zabbix/zabbix_server.conf; then
-    sed -i "s|^DBPassword=.*|DBPassword=${ZABBIX_DB_PW}|" /etc/zabbix/zabbix_server.conf
-elif grep -q '^# DBPassword=' /etc/zabbix/zabbix_server.conf; then
-    sed -i "s|^# DBPassword=.*|DBPassword=${ZABBIX_DB_PW}|" /etc/zabbix/zabbix_server.conf
-else
-    echo "DBPassword=${ZABBIX_DB_PW}" >> /etc/zabbix/zabbix_server.conf
-fi
+# DBName/DBUser are set explicitly rather than relying on the package
+# defaults - stage 1 exposes them as variables, so they can legitimately
+# differ from 'zabbix'.
+set_conf /etc/zabbix/zabbix_server.conf DBName     "${ZABBIX_DB_NAME}"
+set_conf /etc/zabbix/zabbix_server.conf DBUser     "${ZABBIX_DB_USER}"
+set_conf /etc/zabbix/zabbix_server.conf DBPassword "${ZABBIX_DB_PW}"
 chown root:zabbix /etc/zabbix/zabbix_server.conf
 chmod 0640 /etc/zabbix/zabbix_server.conf
 
@@ -200,17 +255,26 @@ chown -R www-data:www-data "$WEBROOT"
 # --- Apache vhost --------------------------------------------------------
 echo "==> Configuring Apache vhost"
 a2enmod ssl headers rewrite alias
+
+# ports.conf is a dpkg conffile.  Keep the packaged original the first time
+# it is replaced so the upgrade prompt on future apache2 updates can be
+# answered from evidence rather than memory.
+if [ -f /etc/apache2/ports.conf ] && [ ! -f /etc/apache2/ports.conf.dpkg-orig ]; then
+    cp -a /etc/apache2/ports.conf /etc/apache2/ports.conf.dpkg-orig
+    echo "    (original ports.conf saved as ports.conf.dpkg-orig)"
+fi
 cat > /etc/apache2/ports.conf <<PORTSEOF
-Listen ${TS_IP4}:80
-Listen ${TS_IP4}:443
+Listen ${BIND_ADDR}:80
+Listen ${BIND_ADDR}:443
 PORTSEOF
+
 cat > "$APACHE_VHOST" <<VHOSTEOF
-<VirtualHost ${TS_IP4}:80>
+<VirtualHost ${BIND_ADDR}:80>
     ServerName ${TS_HOSTNAME}
     Redirect permanent / https://${TS_HOSTNAME}/
 </VirtualHost>
 
-<VirtualHost ${TS_IP4}:443>
+<VirtualHost ${BIND_ADDR}:443>
     ServerName ${TS_HOSTNAME}
     DocumentRoot ${WEBROOT}
 
@@ -249,8 +313,11 @@ cat > /etc/sysctl.d/99-nonlocal-bind.conf <<'SYSCTLEOF'
 # Let services bind an address before the interface is up (Tailscale IP at
 # boot).  Cockpit's socket uses FreeBind=yes for the same reason; Apache and
 # the Wazuh dashboard have no equivalent, so this is set kernel-wide.
+# NOTE: this is a host-wide relaxation - record it in your config baseline
+# if the box is subject to a hardening audit.
 net.ipv4.ip_nonlocal_bind = 1
 SYSCTLEOF
+chmod 0644 /etc/sysctl.d/99-nonlocal-bind.conf
 sysctl -q -p /etc/sysctl.d/99-nonlocal-bind.conf
 
 echo "==> Ordering apache2 after tailscaled"
@@ -260,32 +327,49 @@ cat > /etc/systemd/system/apache2.service.d/tailscale.conf <<'APEOF'
 After=tailscaled.service network-online.target
 Wants=tailscaled.service network-online.target
 APEOF
+chmod 0644 /etc/systemd/system/apache2.service.d/tailscale.conf
 systemctl daemon-reload
 
 # --- Agent2 --------------------------------------------------------------
 echo "==> Configuring zabbix-agent2"
-sed -i 's|^Server=.*|Server=127.0.0.1|'             /etc/zabbix/zabbix_agent2.conf
-sed -i 's|^ServerActive=.*|ServerActive=127.0.0.1|' /etc/zabbix/zabbix_agent2.conf
-sed -i "s|^Hostname=.*|Hostname=${ZABBIX_SERVER_NAME}|" /etc/zabbix/zabbix_agent2.conf
+set_conf /etc/zabbix/zabbix_agent2.conf Server       "127.0.0.1"
+set_conf /etc/zabbix/zabbix_agent2.conf ServerActive "127.0.0.1"
+set_conf /etc/zabbix/zabbix_agent2.conf Hostname     "${ZABBIX_SERVER_NAME}"
 
 # --- Start services ------------------------------------------------------
 echo "==> Starting services"
 systemctl enable zabbix-server zabbix-agent2 apache2
 systemctl restart zabbix-server zabbix-agent2 apache2
-sleep 3
-systemctl is-active --quiet zabbix-server || {
+
+# Zabbix 8.0 takes longer than a few seconds to come up, especially on
+# rotational storage - poll rather than sleeping a fixed interval.
+echo "==> Waiting for zabbix-server to bind :10051"
+for _ in $(seq 1 30); do
+    ss -lnt 2>/dev/null | grep -q ':10051 ' && break
+    sleep 2
+done
+if ! systemctl is-active --quiet zabbix-server; then
     echo "WARNING: zabbix-server not active. Check:" >&2
     echo "  journalctl -u zabbix-server -n 50 --no-pager" >&2
     echo "  tail -50 /var/log/zabbix/zabbix_server.log" >&2
-}
+elif ! ss -lnt 2>/dev/null | grep -q ':10051 '; then
+    echo "WARNING: zabbix-server is running but :10051 is not listening yet." >&2
+    echo "  tail -50 /var/log/zabbix/zabbix_server.log" >&2
+fi
 
 cat <<DONEEOF
 
 ===========================================================
 Stage 2 complete.  (site: ${SITE})
+  Version   ${CANDVER}
   Landing   https://${TS_HOSTNAME}/
   Zabbix    https://${TS_HOSTNAME}/zabbix
+  Bind      ${BIND_ADDR} (APACHE_BIND=${APACHE_BIND})
   Login     Admin / zabbix     <-- CHANGE IMMEDIATELY
 Next: 03-wazuh-allinone.sh  (Wazuh on :${WAZUH_PORT})
+
+Restarting MariaDB stops zabbix-server too (the HA manager stands the
+node down when the database goes away).  Stop zabbix-server first, then
+restart MariaDB, then start zabbix-server.
 ===========================================================
 DONEEOF
