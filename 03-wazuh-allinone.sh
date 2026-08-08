@@ -162,6 +162,16 @@ echo "    indexer OK (heap ${INDEXER_HEAP})"
 # --- manager -------------------------------------------------------------
 echo "==> wazuh-manager"
 apt-get install -y wazuh-manager
+
+# The manager's own indexer connector (separate from filebeat) ships with
+# <host>https://0.0.0.0:9200</host>.  0.0.0.0 is a bind address, not a
+# destination - the connector cannot dial it, and every agent sync fails with
+# "No available server".  Nothing during this install exercises the connector,
+# so the failure only appears when the first agent enrols.
+sed -i "s|https://0\.0\.0\.0:9200|https://${WAZUH_IP}:9200|" /var/ossec/etc/ossec.conf
+grep -q "https://${WAZUH_IP}:9200" /var/ossec/etc/ossec.conf \
+    || die "indexer host rewrite failed - check the <indexer> block in /var/ossec/etc/ossec.conf"
+
 systemctl daemon-reload; systemctl enable --now wazuh-manager
 systemctl is-active --quiet wazuh-manager || die "manager failed"
 echo "    manager OK"
@@ -244,7 +254,16 @@ echo "    ${GOT} passwords captured"
 [ -n "${WAZUH_KIBANASERVER_PW:-}" ] || die "kibanaserver password not captured - check $CRED_FILE"
 yml_set "$DASH" "opensearch.username" "kibanaserver"
 yml_set "$DASH" "opensearch.password" "${WAZUH_KIBANASERVER_PW}"
-systemctl restart filebeat wazuh-dashboard
+
+# The manager authenticates to the indexer from its OWN keystore, which is
+# distinct from filebeat's.  Nothing sets it during a stock install, and the
+# rotation above has just changed the admin password out from under it, so it
+# must be written here - after rotation, before the manager restarts.
+echo "==> Storing indexer credentials in the manager keystore"
+/var/ossec/bin/wazuh-keystore -f indexer -k username -v admin
+/var/ossec/bin/wazuh-keystore -f indexer -k password -v "${WAZUH_ADMIN_PW}"
+
+systemctl restart wazuh-manager filebeat wazuh-dashboard
 
 # --- final health --------------------------------------------------------
 echo "==> Final health check"
@@ -255,6 +274,22 @@ for s in wazuh-indexer wazuh-manager filebeat wazuh-dashboard; do
 done
 # This also proves the rotation did not orphan filebeat's stored credentials.
 filebeat test output 2>&1 | grep -qi 'talk to server... OK' || { echo "    FAIL filebeat->indexer" >&2; FAIL=1; }
+
+# The manager's indexer connector is a separate path from filebeat's and fails
+# silently at install time - the errors ("No available server", "IndexerConnector
+# initialization failed") only appear once an agent enrols.  Check the log
+# directly so a broken connector is caught here rather than weeks later.
+sleep 10
+if grep -qE 'IndexerConnector initialization failed|No available server' \
+     /var/ossec/logs/ossec.log 2>/dev/null; then
+  echo "    FAIL manager->indexer connector" >&2
+  echo "         check <indexer> host and 'wazuh-keystore -f indexer' creds" >&2
+  tail -5 /var/ossec/logs/ossec.log >&2
+  FAIL=1
+else
+  echo "    OK   manager->indexer connector"
+fi
+
 [ "$FAIL" -eq 0 ] || die "services unhealthy after rotation"
 
 # NOTE: the password is deliberately NOT expanded below - printing it here
