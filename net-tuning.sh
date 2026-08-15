@@ -52,6 +52,7 @@
 #   ./net-tuning.sh --check              show state and conflicts, change nothing
 #   ./net-tuning.sh                      apply sysctls (no disruption)
 #   ./net-tuning.sh --with-nic           also raises NIC rings (BRIEF LINK RESET)
+#   ./net-tuning.sh --with-nic --install-deps   install ethtool if missing
 #   ./net-tuning.sh --revert             roll back using the newest snapshot
 #   ./net-tuning.sh --revert --state F   roll back using a specific snapshot
 #   ./net-tuning.sh --list-states        show captured snapshots
@@ -86,10 +87,13 @@ KEYS=(
 MODE="apply"
 WITH_NIC=0
 STATE_PICK=""
+INSTALL_DEPS=0
+INSTALLED_ETHTOOL=no
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-nic)    WITH_NIC=1 ;;
+        --install-deps) INSTALL_DEPS=1 ;;
         --check)       MODE="check" ;;
         --revert)      MODE="revert" ;;
         --list-states) MODE="list" ;;
@@ -249,6 +253,11 @@ if [ "$MODE" = "revert" ]; then
         modprobe -r tcp_bbr 2>/dev/null && say "  unloaded tcp_bbr module"
     fi
 
+    if [ "${INSTALLED_ETHTOOL:-no}" = "yes" ]; then
+        say "  NOTE: that run installed ethtool. Remove manually if unwanted:"
+        say "        apt-get remove ethtool"
+    fi
+    
     say ""
     say "Reverted. Note that sysctl --system on next boot re-reads all files;"
     say "if a conflicting file listed by --check sets these keys, it wins."
@@ -296,6 +305,7 @@ mkdir -p "$ARCHIVE"
     echo "PRE_SYSCTL_FILE_EXISTED='$([ -f "$SYSCTL_FILE" ] && echo yes || echo no)'"
     echo "PRE_MODULE_FILE_EXISTED='$([ -f "$MODULE_FILE" ] && echo yes || echo no)'"
     echo "PRE_NIC_UNIT_EXISTED='$([ -f "$NIC_UNIT" ] && echo yes || echo no)'"
+    echo "INSTALLED_ETHTOOL='$INSTALLED_ETHTOOL'"
     echo "PRE_CONFLICTS='$(echo $CONFLICTS)'"
 } > "$STATE"
 chmod 600 "$STATE"
