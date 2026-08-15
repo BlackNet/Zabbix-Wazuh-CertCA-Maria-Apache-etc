@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # net-tuning.sh - TCP + NIC tuning, with a real rollback.
-# loki.street-tek.com, applied 2026-08-10. Revised 2026-08-14.
+# Loki, applied 2026-08-10. Revised 2026-08-14.
 #
 # ============================================================================
 # WHY THIS EXISTS
@@ -18,7 +18,7 @@
 #      BBR models bottleneck bandwidth and RTT directly and ignores
 #      non-congestive loss. cwnd went from 41 to 3052 segments.
 #
-#   2. Send buffer ceiling. Even on BBR the socket reported sndbuf_limited
+#   2. Send buffer ceiling. Even on BBR, the socket reported sndbuf_limited
 #      45% of the time - data ready, nowhere to put it. Sustaining 100 MB/s at
 #      85 ms RTT needs ~8.5 MB in flight; Debian's tcp_wmem tops out at 4 MB.
 #
@@ -45,13 +45,13 @@
 #
 # --revert replays that snapshot. It restores prior values verbatim, puts back
 # archived files, removes files this script created, and resets ring buffers.
-# If no snapshot exists it refuses to act rather than guessing.
+# If no snapshot exists, it refuses to act rather than guessing.
 #
 # ============================================================================
 # USAGE
 #   ./net-tuning.sh --check              show state and conflicts, change nothing
 #   ./net-tuning.sh                      apply sysctls (no disruption)
-#   ./net-tuning.sh --with-nic           also raise NIC rings (BRIEF LINK RESET)
+#   ./net-tuning.sh --with-nic           also raises NIC rings (BRIEF LINK RESET)
 #   ./net-tuning.sh --revert             roll back using the newest snapshot
 #   ./net-tuning.sh --revert --state F   roll back using a specific snapshot
 #   ./net-tuning.sh --list-states        show captured snapshots
@@ -107,7 +107,7 @@ IFACE=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
 hdr() { printf '\n== %s\n' "$*"; }
 say() { printf '%s\n' "$*"; }
 
-# sysctl values can contain tabs (tcp_rmem). Normalise to single spaces so the
+# sysctl values can contain tabs (tcp_rmem). Normalize to single spaces so the
 # snapshot round-trips cleanly.
 getval() { sysctl -n "$1" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ *$//'; }
 
@@ -323,7 +323,7 @@ cat > "$SYSCTL_FILE" <<'EOF'
 # Managed by /usr/local/sbin/net-tuning.sh - see that file for the reasoning.
 # Snapshot of prior values is under /var/lib/net-tuning/.
 
-# BBR measures bottleneck bandwidth and RTT rather than inferring congestion
+# BBR measures bottleneck bandwidth, and RTT rather than inferring congestion
 # from packet loss, so a lossy long-distance path does not collapse the send
 # window. Worth ~30x on an 85 ms path carrying 0.1% loss.
 net.ipv4.tcp_congestion_control = bbr
@@ -388,7 +388,7 @@ show_state
 cat <<EOF
 Rollback
     $0 --revert                 uses $STATE
-    $0 --list-states            show all snapshots
+    $0 --list-states            shows all snapshots
 
 These apply to NEW sockets. A running service keeps whatever it started with:
 
