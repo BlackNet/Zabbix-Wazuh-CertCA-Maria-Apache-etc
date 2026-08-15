@@ -6,7 +6,7 @@
 # ============================================================================
 # WHY THIS EXISTS
 # ============================================================================
-# A 940 GB Active Backup transfer from loki (Teterboro NJ) to a Synology NAS
+# A 940 GB Active Backup transfer from Loki (Teterboro NJ) to a Synology NAS
 # (Alabama) over Tailscale ran at 863 KB/s on a path capable of ~250 Mbit/s.
 # Two sender-side problems:
 #
