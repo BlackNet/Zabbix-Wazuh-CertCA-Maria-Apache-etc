@@ -141,12 +141,15 @@ show_state() {
         "$(getval net.ipv4.tcp_available_congestion_control)"
 
     hdr "Interface"
-    if [ -n "$IFACE" ] && command -v ethtool >/dev/null 2>&1; then
+    if [ -z "$IFACE" ]; then
+        printf '  %-34s %s\n' "device" "none detected (no default route)"
+    elif ! command -v ethtool >/dev/null 2>&1; then
+        printf '  %-34s %s\n' "device" "$IFACE"
+        printf '  %-34s %s\n' "ring buffers" "unknown - ethtool not installed (apt install ethtool)"
+    else
         printf '  %-34s %s\n' "device" "$IFACE"
         printf '  %-34s %s / %s\n' "ring RX current / max" "$(ring_now)" "$(ring_max)"
         printf '  %-34s %s\n' "ring TX current" "$(ring_now_tx)"
-    else
-        printf '  %-34s %s\n' "device" "${IFACE:-unknown} (ethtool not available)"
     fi
 
     hdr "Files"
