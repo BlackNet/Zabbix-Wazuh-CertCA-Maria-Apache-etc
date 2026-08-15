@@ -326,7 +326,7 @@ cat > "$SYSCTL_FILE" <<'EOF'
 # Managed by /usr/local/sbin/net-tuning.sh - see that file for the reasoning.
 # Snapshot of prior values is under /var/lib/net-tuning/.
 
-# BBR measures bottleneck bandwidth, and RTT rather than inferring congestion
+# BBR measures bottleneck bandwidth and RTT, rather than inferring congestion
 # from packet loss, so a lossy long-distance path does not collapse the send
 # window. Worth ~30x on an 85 ms path carrying 0.1% loss.
 net.ipv4.tcp_congestion_control = bbr
